@@ -12,7 +12,9 @@ memory-bounds the 80/10/10 split + per-rank edge shard for the ~13B-edge cut (re
 standalone ``edge_index.npy``, never the whole array); ``--eval-edges`` bounds the periodic MRR;
 and ``--ckpt-dir`` / ``--ckpt-every-iters`` give resumable epoch- and mid-epoch checkpoints. Shallow
 dot or GraphSAGE encoder; parity target vs 100 negatives = in-house dot 0.780. See
-docs/phase4-full-cc-plan.md §4f for the full-CC launch recipe.
+docs/phase4-full-cc-plan.md §4f for the full-CC launch recipe. ``--decoder hyperbolic`` swaps the
+dot product for a hyperbolic (Lorentz) distance decoder over the same table (``cupyg/geometry.py``,
+``docs/hyperbolic.md``); the default ``dot`` is the published artifact.
 
 Featureless: link prediction learns a per-node embedding table (``nn.Embedding``); there are no
 input node features. Homogeneous: one node type ``node`` and one edge relation ``[node, links,
@@ -52,6 +54,7 @@ import torch
 
 from cupyg.checkpoint import _any_rank_stop, _save_cupyg_ckpt, _SignalCatcher
 from cupyg.evaluate import eval_mrr, eval_mrr_gathered, export_table_chunked
+from cupyg.geometry import MAX_NORM_LIMIT, make_decoder
 from cupyg.loader_free import _SamplerFreeEdgeLoader
 from cupyg.model import LPModel, _base
 from cupyg.runtime import _log_vram, init_worker
@@ -88,6 +91,38 @@ def main() -> None:  # noqa: D103
     ap.add_argument("--graph", required=True)
     ap.add_argument("--encoder", choices=("shallow", "sage"), default="shallow")
     ap.add_argument("--dim", type=int, default=128)
+    ap.add_argument(
+        "--decoder",
+        choices=("dot", "hyperbolic"),
+        default="dot",
+        help="Edge scorer. dot: e_u . e_v (the published artifact). hyperbolic: Fermi-Dirac "
+        "(margin - d)/temp over Lorentz-model geodesic distance; the table stores tangent vectors "
+        "at the origin, so the sharded table + sparse Adam are unchanged (docs/hyperbolic.md).",
+    )
+    ap.add_argument(
+        "--hyp-margin",
+        type=float,
+        default=2.0,
+        help="hyperbolic: distance at which a pair scores logit 0 (closer -> linked).",
+    )
+    ap.add_argument(
+        "--hyp-temp", type=float, default=1.0, help="hyperbolic: logit temperature (> 0)."
+    )
+    ap.add_argument(
+        "--hyp-max-norm",
+        type=float,
+        default=20.0,
+        help=f"hyperbolic: clip tangent norms (= distance from the origin) to this radius; keeps "
+        f"sinh() inside fp32 (max {MAX_NORM_LIMIT:g}).",
+    )
+    ap.add_argument(
+        "--hyp-init-radius",
+        type=float,
+        default=2.0,
+        help="hyperbolic: start every host at this distance from the origin (random direction) "
+        "instead of the table's near-zero init, where untrained hosts would be close to everyone. "
+        "0 keeps the table's own init.",
+    )
     ap.add_argument("--num-layers", type=int, default=2)
     ap.add_argument("--fanout", default="10,5", help="Comma sep neighbour fanout per hop.")
     ap.add_argument("--epochs", type=int, default=10)
@@ -240,6 +275,13 @@ def main() -> None:  # noqa: D103
     init_worker(global_rank, local_rank, world_size, cugraph_id[0])
 
     is_main = global_rank == 0
+    decoder = make_decoder(
+        args.decoder,
+        margin=args.hyp_margin,
+        temperature=args.hyp_temp,
+        max_norm=args.hyp_max_norm,
+        init_radius=args.hyp_init_radius,
+    )
     fanout = [int(x) for x in args.fanout.split(",")]
     # Sampler-free is shallow-only (sage needs the sampled subgraph): skip the GraphStore + sampler.
     sampler_free = args.sampler_free and args.encoder == "shallow"
@@ -309,11 +351,19 @@ def main() -> None:  # noqa: D103
             random_init=True,
         )
         _log_vram("after create_embedding (table allocated)", local_rank)
+        if args.decoder == "hyperbolic":
+            # Move every host off the origin: rewrite this rank's local shard in place, the same
+            # way create_embedding(random_init=True) wrote it, then barrier before anyone gathers.
+            local_shard, _ = wg_emb.get_embedding_tensor().get_local_tensor()
+            decoder.init_(local_shard)
+            comm.barrier()
         emb_module = wgth.embedding.WholeMemoryEmbeddingModule(wg_emb)
         wm_opt = wgth.create_wholememory_optimizer([wg_emb], "adam", {})
         _log_vram("after create_wholememory_optimizer (Adam states)", local_rank)
 
     model = LPModel(num_nodes, args.dim, args.encoder, args.num_layers, emb_module).cuda()
+    if args.decoder == "hyperbolic" and not args.wg_embed:
+        decoder.init_(model.emb.weight.data)
     _log_vram("after model.cuda()", local_rank)
     # Dense Adam covers only torch params (the sage convs); the sharded shallow model has none, so
     # its optimizer is None and all learning flows through the WholeMemory sparse optimizer.
@@ -351,7 +401,8 @@ def main() -> None:  # noqa: D103
         wg = f"wg-embed[{args.wg_location}] " if args.wg_embed else ""
         print(
             f"{wg}world_size={world_size} encoder={args.encoder} dim={args.dim} fanout={fanout} "
-            f"dense_params={n_dense:,} neg_mode={args.neg_mode} train_neg={args.train_neg}",
+            f"dense_params={n_dense:,} neg_mode={args.neg_mode} train_neg={args.train_neg} "
+            f"decoder={decoder.describe()}",
             flush=True,
         )
 
@@ -491,6 +542,7 @@ def main() -> None:  # noqa: D103
             ckpt_every=args.ckpt_every_iters,
             save_cb=(_mid_save if ckpt_dir is not None else None),
             stop_cb=_stop,
+            decoder=decoder,
         )
         global_step += iters_run
         if stopped:
@@ -516,10 +568,12 @@ def main() -> None:  # noqa: D103
         # Shallow gathers only the rows each eval chunk needs (never the ~27 GB full-CC table);
         # sage's message-passed reps require the full-node pass. Both are collective across ranks.
         if args.encoder == "shallow":
-            val = eval_mrr_gathered(model, val_e, num_nodes, args.eval_neg, (1, 10), eval_gen)
+            val = eval_mrr_gathered(
+                model, val_e, num_nodes, args.eval_neg, (1, 10), eval_gen, decoder
+            )
         else:
             emb = _sampled().node_embeddings(model, stores, num_nodes, fanout, args.dim)
-            val = eval_mrr(emb, val_e, args.eval_neg, (1, 10), eval_gen)
+            val = eval_mrr(emb, val_e, args.eval_neg, (1, 10), eval_gen, decoder)
         if writer:
             for key, value in val.items():
                 writer.add_scalar(f"val/{key}", value, global_step)
@@ -596,10 +650,12 @@ def main() -> None:  # noqa: D103
         if is_main:
             print(f"restored best wm table (ep {best_epoch}, val_mrr={best_val:.4f})", flush=True)
     if args.encoder == "shallow":  # gather-per-chunk eval (no full-table materialization)
-        test = eval_mrr_gathered(model, test_e, num_nodes, args.eval_neg, (1, 10), eval_gen)
+        test = eval_mrr_gathered(
+            model, test_e, num_nodes, args.eval_neg, (1, 10), eval_gen, decoder
+        )
     else:
         emb = _sampled().node_embeddings(model, stores, num_nodes, fanout, args.dim)
-        test = eval_mrr(emb, test_e, args.eval_neg, (1, 10), eval_gen)
+        test = eval_mrr(emb, test_e, args.eval_neg, (1, 10), eval_gen, decoder)
     if writer:
         for key, value in test.items():
             writer.add_scalar(f"test/{key}", value, global_step)
@@ -611,7 +667,8 @@ def main() -> None:  # noqa: D103
         run.finish()
     if is_main:
         print(
-            f"[result] encoder={args.encoder} wg_embed={args.wg_embed} world_size={world_size} "
+            f"[result] encoder={args.encoder} decoder={args.decoder} wg_embed={args.wg_embed} "
+            f"world_size={world_size} "
             f"test_mrr={test['mrr']:.4f} test_hits@1={test['hits@1']:.4f} "
             f"test_hits@10={test['hits@10']:.4f} "
             f"(best_epoch={best_epoch} best_val_mrr={best_val:.4f}; in-house dot reference=0.780)",
@@ -624,9 +681,11 @@ def main() -> None:  # noqa: D103
     # keeps it) to bound the full-CC GPU peak; sage's rank-0 `emb` is already the whole table.
     if args.export_emb:
         if args.encoder == "shallow":
-            emb_np = export_table_chunked(model, num_nodes, args.dim, keep=is_main)
+            emb_np = export_table_chunked(model, num_nodes, args.dim, keep=is_main, decoder=decoder)
         else:
-            emb_np = emb.detach().cpu().numpy().astype(np.float32) if is_main else None
+            emb_np = (
+                decoder.prepare(emb).detach().cpu().numpy().astype(np.float32) if is_main else None
+            )
     if args.export_emb and is_main:
         out = Path(args.export_emb)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -636,6 +695,7 @@ def main() -> None:  # noqa: D103
             "num_nodes": num_nodes,
             "dim": args.dim,
             "encoder": args.encoder,
+            **decoder.describe(),  # "decoder" (+ hyp_* settings); shard-export keys geometry on it
             "wg_embed": args.wg_embed,
             "wg_dtype": args.wg_dtype,
             "world_size": world_size,

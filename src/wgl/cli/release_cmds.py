@@ -105,8 +105,11 @@ def release_shard_export(
         help="Published tier(s): fp32 (canonical), fp16 (primary half-precision), or both "
         "(fp32 + fp16 sidecar).",
     ),
-    normalize: bool = typer.Option(
-        True, help="L2-normalize vectors (contract default); --no-normalize keeps raw magnitudes."
+    normalize: bool | None = typer.Option(
+        None,
+        "--normalize/--no-normalize",
+        help="L2-normalize vectors. Default: on for dot tables (contract default), off for tables "
+        "whose --meta sidecar says decoder=hyperbolic (normalizing those is refused).",
     ),
     limit: int = typer.Option(None, help="Process only the first N rows (smoke test)."),
 ) -> None:

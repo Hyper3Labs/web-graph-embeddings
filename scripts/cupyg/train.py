@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import torch
 
+from cupyg.geometry import DOT, Decoder
 from cupyg.losses import _binary_loss, _inbatch_loss
 from cupyg.runtime import _log_vram
 
@@ -28,6 +29,7 @@ def train_epoch(
     ckpt_every: int = 0,
     save_cb: object = None,
     stop_cb: object = None,
+    decoder: Decoder = DOT,
 ) -> tuple[float, int, bool]:
     """Run one epoch of binary-NLL LP training; return ``(mean_loss, iters_run, stopped)``.
 
@@ -44,6 +46,7 @@ def train_epoch(
     ``ckpt_every`` iters and ``stop_cb()`` (an all-ranks-agree preemption check) can end the epoch
     early -> at most ``ckpt_every`` iters lost on preemption. These boundaries are collective, so
     the caller must run all ranks for the same capped iteration count (see the ``epoch_cap``).
+    ``decoder`` scores edges (default: the published dot product; see :mod:`cupyg.geometry`).
     """
     model.train()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -59,9 +62,9 @@ def train_epoch(
             opt.zero_grad()
         x = model(batch)
         if neg_mode == "inbatch":
-            loss, n = _inbatch_loss(x, batch, train_neg)
+            loss, n = _inbatch_loss(x, batch, train_neg, decoder)
         else:
-            loss, n = _binary_loss(x, batch)
+            loss, n = _binary_loss(x, batch, decoder)
         loss.backward()
         if opt is not None:
             opt.step()

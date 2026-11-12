@@ -17,6 +17,10 @@ depends on. "Locate one host without loading all vectors" is still O(1): look ``
 shard's ``host_key``/``row_id`` columns, then ``shard = row_id // rows_per_shard``.
 
 Published vectors are **L2-normalized** (cosine = dot on unit vectors) unless ``normalize=False``.
+A table trained with ``--decoder hyperbolic`` (read from the export sidecar's ``decoder``) is
+published un-normalized (its rows are tangent vectors whose norm is the host's hyperbolic radius),
+and the manifest records ``distance: "hyperbolic"`` plus a ``geometry`` block (see
+``docs/hyperbolic.md``).
 ``precision`` picks the published tier(s): ``fp32`` (canonical lossless), ``fp16`` (half-precision
 as the *primary* tier — negligible cosine error on unit vectors, half the download), or ``both``
 (fp32 canonical + an fp16 sidecar set). The primary tier is always written to ``vectors/``; ``both``
@@ -139,7 +143,7 @@ def export_parquet_shards(
     out_dir: Path,
     *,
     rows_per_shard: int = 4_000_000,
-    normalize: bool = True,
+    normalize: bool | None = None,
     precision: str = "both",
     release_id: str,
     source_crawls: list[str],
@@ -160,20 +164,35 @@ def export_parquet_shards(
         names_path: ``node_names.txt`` — one reversed CC host name per row, aligned to ``emb`` rows.
         out_dir: Destination directory for the shard set(s) + ``manifest.json``.
         rows_per_shard: Rows per contiguous shard (shard = ``row_id // rows_per_shard``).
-        normalize: L2-normalize each vector (the contract default); ``False`` keeps raw magnitudes.
+        normalize: L2-normalize each vector; ``False`` keeps raw magnitudes. ``None`` (default)
+            normalizes dot tables (the contract default) and keeps hyperbolic ones raw.
         precision: One of ``fp32`` / ``fp16`` / ``both`` (see :data:`PRECISION_SETS`).
         release_id: Stable release id (the crawl window).
         source_crawls: Constituent monthly crawl ids recorded in the manifest.
         model_space_version: Embedding model-space tag (vectors only compare within one tag).
-        meta: Optional export sidecar dict (``encoder`` + metrics) folded into the manifest.
+        meta: Optional export sidecar dict (``encoder``, ``decoder`` + metrics) folded into the
+            manifest; ``decoder == "hyperbolic"`` selects the hyperbolic geometry.
         limit: Process only the first N rows (smoke test); disables the trailing-alignment check.
 
     Returns:
         Path to the written ``manifest.json``.
+
+    Raises:
+        ValueError: On a bad ``precision``, a non-2-D table, misaligned names, or
+            ``normalize=True`` for a hyperbolic table.
     """
     if precision not in PRECISION_SETS:
         raise ValueError(f"precision must be one of {sorted(PRECISION_SETS)}, got {precision!r}")
     meta = meta or {}
+    decoder = meta.get("decoder", "dot")
+    hyperbolic = decoder == "hyperbolic"
+    if normalize is None:
+        normalize = not hyperbolic
+    elif normalize and hyperbolic:
+        raise ValueError(
+            "refusing to L2-normalize a hyperbolic table: each row's norm is the host's hyperbolic "
+            "radius, so normalizing would collapse every host onto one sphere"
+        )
     sets = PRECISION_SETS[precision]
     emb = np.load(emb_path, mmap_mode="r")
     if emb.ndim != 2:
@@ -231,11 +250,12 @@ def export_parquet_shards(
         "release_id": release_id,
         "source_crawls": source_crawls,
         "encoder": meta.get("encoder"),
+        "decoder": decoder,
         "dim": dim,
         "num_rows": num_rows,
         "rows_per_shard": rows_per_shard,
         "num_shards": num_shards,
-        "distance": "cosine",
+        "distance": "hyperbolic" if hyperbolic else "cosine",
         "normalized": normalize,
         "input_norm_min_mean_max": [nmin, nmean, nmax],
         "columns": {
@@ -253,6 +273,17 @@ def export_parquet_shards(
         },
         "shards": shards,
     }
+    if hyperbolic:
+        manifest["geometry"] = {
+            "model": "lorentz",
+            "curvature": -1.0,
+            "coordinates": "tangent vector at the origin; point = exp_0(v), |v| = radius",
+            "decoder": "fermi-dirac: logit = (margin - d(u, v)) / temperature",
+            "margin": meta.get("hyp_margin"),
+            "temperature": meta.get("hyp_temp"),
+            "max_norm": meta.get("hyp_max_norm"),
+            "helpers": "wgl.hyperbolic (distance, to_lorentz, to_poincare)",
+        }
     manifest_path = out_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     kinds = "+".join(k for k, _ in sets)

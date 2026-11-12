@@ -169,3 +169,75 @@ def test_fp16_only_is_the_primary_tier(tmp_path):
     # fp16 round-trip stays within half-precision tolerance of the L2-normalized direction.
     raw_unit = emb / np.linalg.norm(emb, axis=1, keepdims=True)
     np.testing.assert_allclose(mat, raw_unit, atol=1e-3)
+
+
+_HYP_META = {
+    "encoder": "shallow",
+    "decoder": "hyperbolic",
+    "hyp_margin": 2.0,
+    "hyp_temp": 1.0,
+    "hyp_max_norm": 20.0,
+}
+
+
+def test_hyperbolic_table_keeps_radius_and_records_geometry(tmp_path):
+    emb, emb_path, names_path = _write_inputs(tmp_path, n=5, dim=4)
+    out = tmp_path / "hf"
+    export_shards(
+        emb_path,
+        names_path,
+        out,
+        rows_per_shard=2,
+        precision="fp32",
+        release_id="cc-main-test",
+        source_crawls=["CC-A"],
+        model_space_version="test_hyp_v1",
+        meta=_HYP_META,
+    )  # normalize left at its default: hyperbolic -> raw tangent vectors
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["normalized"] is False
+    assert manifest["decoder"] == "hyperbolic"
+    assert manifest["distance"] == "hyperbolic"
+    assert manifest["geometry"]["model"] == "lorentz"
+    assert manifest["geometry"]["max_norm"] == 20.0
+    vecs = []
+    for shard in manifest["shards"]["vectors"]:
+        t = pq.read_table(out / shard["filename"]).to_pydict()
+        vecs += [np.asarray(v, dtype=np.float32) for v in t["embedding"]]
+    np.testing.assert_array_equal(np.vstack(vecs), emb)
+
+
+def test_dot_table_default_still_normalizes(tmp_path):
+    _, emb_path, names_path = _write_inputs(tmp_path, n=3, dim=4)
+    out = tmp_path / "hf"
+    export_shards(
+        emb_path,
+        names_path,
+        out,
+        precision="fp32",
+        release_id="cc-main-test",
+        source_crawls=["CC-A"],
+        model_space_version="test_v1",
+        meta={"encoder": "shallow"},  # pre-decoder sidecars carry no "decoder" key
+    )
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["normalized"] is True
+    assert manifest["distance"] == "cosine"
+    assert manifest["decoder"] == "dot"
+    assert "geometry" not in manifest
+
+
+def test_normalizing_a_hyperbolic_table_is_refused(tmp_path):
+    _, emb_path, names_path = _write_inputs(tmp_path, n=3, dim=4)
+    with pytest.raises(ValueError, match="hyperbolic"):
+        export_shards(
+            emb_path,
+            names_path,
+            tmp_path / "hf",
+            normalize=True,
+            precision="fp32",
+            release_id="cc-main-test",
+            source_crawls=["CC-A"],
+            model_space_version="test_hyp_v1",
+            meta=_HYP_META,
+        )

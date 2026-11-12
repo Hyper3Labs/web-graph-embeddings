@@ -87,6 +87,12 @@ PyTorch-BigGraph dot** family.
 Because the scorer is symmetric, **edge direction is discarded** — `e_u · e_v` cannot distinguish a
 link from its reverse. The graph is directed; the embedding is not.
 
+**Experimental: hyperbolic decoder.** `--decoder hyperbolic` trains the same table but scores links by
+geodesic distance in hyperbolic space (Lorentz model), which suits hierarchical, heavy-tailed graphs.
+The published artifact does not use it. See [`docs/hyperbolic.md`](docs/hyperbolic.md) for how it
+works, how to export and query it (`wgl.hyperbolic`), and a comparison against `dot` on a Common
+Crawl sample.
+
 ## Evaluation
 
 The model is trained only to predict links, so every result below is a probe of what link structure

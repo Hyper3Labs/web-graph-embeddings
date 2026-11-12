@@ -1,7 +1,9 @@
 """Held-out MRR/hits and the frozen embedding-table export.
 
 ``eval_mrr_gathered`` is the sharded path: it gathers only the node ids a scoring chunk needs, so
-the ~27 GB full-CC table never has to fit on one GPU.
+the ~27 GB full-CC table never has to fit on one GPU. Ranking uses the training ``decoder`` (dot by
+default, or ``(margin - d) / temperature`` for ``--decoder hyperbolic`` -- monotone in ``-d``).
+Device follows the eval generator, so the same code runs on CPU in the unit tests.
 """
 
 from __future__ import annotations
@@ -9,6 +11,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from cupyg.geometry import DOT, Decoder
 from cupyg.model import _base
 
 
@@ -19,19 +22,21 @@ def eval_mrr(
     num_neg: int,
     hits_k: tuple[int, ...],
     gen: torch.Generator,
+    decoder: Decoder = DOT,
 ) -> dict[str, float]:
     """Rank each held-out positive dst against ``num_neg`` uniform negatives -> MRR/Hits@K."""
     n_nodes = emb.shape[0]
-    src = torch.as_tensor(pos[0], device="cuda")
-    dst = torch.as_tensor(pos[1], device="cuda")
+    dev = gen.device
+    src = torch.as_tensor(pos[0], device=dev)
+    dst = torch.as_tensor(pos[1], device=dev)
     ranks: list[torch.Tensor] = []
     chunk = 4096
     for start in range(0, src.shape[0], chunk):
         s, d = src[start : start + chunk], dst[start : start + chunk]
         hs = emb[s]
-        pos_score = (hs * emb[d]).sum(dim=-1)
-        neg = torch.randint(0, n_nodes, (s.shape[0], num_neg), device="cuda", generator=gen)
-        neg_score = torch.bmm(hs.unsqueeze(1), emb[neg].transpose(1, 2)).squeeze(1)
+        pos_score = decoder(hs, emb[d])
+        neg = torch.randint(0, n_nodes, (s.shape[0], num_neg), device=dev, generator=gen)
+        neg_score = decoder.score_candidates(hs, emb[neg])
         ranks.append((neg_score > pos_score[:, None]).sum(dim=1) + 1)
     r = torch.cat(ranks).float()
     hits = {f"hits@{k}": (r <= k).float().mean().item() for k in hits_k}
@@ -61,6 +66,7 @@ def eval_mrr_gathered(
     num_neg: int,
     hits_k: tuple[int, ...],
     gen: torch.Generator,
+    decoder: Decoder = DOT,
 ) -> dict[str, float]:
     """MRR/Hits@K gathering ONLY the rows each chunk needs — the full-CC shallow path.
 
@@ -70,17 +76,18 @@ def eval_mrr_gathered(
     ranks run the SAME chunk count / ids (eval edges replicated, ``gen`` seeded identically) →
     lockstep. Identical result to ``eval_mrr`` over the full table.
     """
-    src = torch.as_tensor(pos[0], device="cuda")
-    dst = torch.as_tensor(pos[1], device="cuda")
+    dev = gen.device
+    src = torch.as_tensor(pos[0], device=dev)
+    dst = torch.as_tensor(pos[1], device=dev)
     ranks: list[torch.Tensor] = []
     chunk = 4096
     for start in range(0, src.shape[0], chunk):
         s, d = src[start : start + chunk], dst[start : start + chunk]
-        neg = torch.randint(0, num_nodes, (s.shape[0], num_neg), device="cuda", generator=gen)
+        neg = torch.randint(0, num_nodes, (s.shape[0], num_neg), device=dev, generator=gen)
         hs = _gather_emb(model, s)
-        pos_score = (hs * _gather_emb(model, d)).sum(dim=-1)
+        pos_score = decoder(hs, _gather_emb(model, d))
         hn = _gather_emb(model, neg.reshape(-1)).reshape(s.shape[0], num_neg, -1)
-        neg_score = torch.bmm(hs.unsqueeze(1), hn.transpose(1, 2)).squeeze(1)
+        neg_score = decoder.score_candidates(hs, hn)
         ranks.append((neg_score > pos_score[:, None]).sum(dim=1) + 1)
     r = torch.cat(ranks).float()
     hits = {f"hits@{k}": (r <= k).float().mean().item() for k in hits_k}
@@ -90,19 +97,27 @@ def eval_mrr_gathered(
 
 @torch.no_grad()
 def export_table_chunked(
-    model: object, num_nodes: int, dim: int, keep: bool, chunk: int = 2_000_000
+    model: object,
+    num_nodes: int,
+    dim: int,
+    keep: bool,
+    chunk: int = 2_000_000,
+    decoder: Decoder = DOT,
 ) -> np.ndarray | None:
     """Assemble the full ``[num_nodes, dim]`` shallow table on CPU by gathering in chunks.
 
     The one-shot ``gather(arange(num_nodes))`` peaks at ~27 GB VRAM and OOMs at full CC; gather
     ``chunk`` rows at a time instead (peak ~``chunk*dim*4`` on device). The gathers are COLLECTIVE,
     so ALL ranks call this in lockstep; only ``keep`` (rank 0) assembles + returns the array (the
-    others gather and discard, returning ``None``).
+    others gather and discard, returning ``None``). Rows pass through ``decoder.prepare`` so the
+    export holds exactly the vectors the decoder scored (identity for dot; the ``max_norm``-clipped
+    tangent vectors for hyperbolic).
     """
     out = np.empty((num_nodes, dim), dtype=np.float32) if keep else None
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
     for start in range(0, num_nodes, chunk):
-        ids = torch.arange(start, min(start + chunk, num_nodes), device="cuda")
-        rows = _gather_emb(model, ids).detach().cpu().numpy().astype(np.float32)
+        ids = torch.arange(start, min(start + chunk, num_nodes), device=dev)
+        rows = decoder.prepare(_gather_emb(model, ids)).detach().cpu().numpy().astype(np.float32)
         if keep:
             out[start : start + rows.shape[0]] = rows
     return out
